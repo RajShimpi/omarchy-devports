@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Dev servers and ports helper for the Dev Ports bar panel.
+
+  devports list                 -> JSON: listening TCP ports with process, project, framework
+  devports stop <pid> [port]    -> SIGTERM the process and its children, then SIGKILL
+                                   whatever is still running after stopGraceSeconds
+  devports kill <pid> [port]    -> SIGKILL the process and its children right away
+  devports editor <path>        -> open a project folder in the editor
+  devports settings             -> create the settings file with defaults, open it
+
+With [port], stop/kill first check that <pid> still listens on that port, so a
+reused pid is never signalled. Only your own processes can be signalled; ports
+owned by root or other users (system services, Docker) are listed read-only.
+
+Settings: ~/.config/omarchy/devports.json (or $DEVPORTS_CONFIG)
+  { "editor": "omarchy-launch-editor", "stopGraceSeconds": 5, "ignore": [] }
+"""
+import json, os, pwd, re, shlex, shutil, signal, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+CONF = os.environ.get("DEVPORTS_CONFIG") or os.path.join(HOME, ".config/omarchy/devports.json")
+DEFAULTS = {"editor": "omarchy-launch-editor", "stopGraceSeconds": 5, "ignore": []}
+CLK = os.sysconf("SC_CLK_TCK")
+
+# Desktop apps that open local ports but are never dev servers (matched on the
+# process name and on the program's file name).
+APPS = re.compile(r"^(cursor|code|codium|vscodium|zed|zeditor|windsurf|electron\d*|brave|chrome|chromium|"
+                  r"google-chrome|firefox|librewolf|zen|vivaldi|msedge|opera|discord|slack|zoom|teams|spotify|"
+                  r"steam|obsidian|signal|telegram|1password|hubstaff|kdeconnect|localsend|syncthing|"
+                  r"claude|dropbox|insync|warp-svc|tailscaled)", re.I)
+# Helpers that are only interesting when they run inside a project.
+TOOLS = re.compile(r"^(cloudflared|ngrok|ssh-agent|gpg-agent|node-ipc|containerd|dockerd)$", re.I)
+NOT_HTTP_NAMES = re.compile(r"^(mariadbd|mysqld|postgres|redis-server|valkey-server|mongod|memcached|kvrocks|sshd|"
+                            r"rabbitmq|beam\.smp|epmd|mosquitto|clickhouse)", re.I)
+NOT_HTTP_PORTS = {22, 25, 53, 110, 143, 465, 587, 993, 995, 1883, 2181, 3306, 4369, 5432, 5672, 6379, 6666,
+                  9092, 11211, 25565, 27017, 33060}
+WELL_KNOWN = {22: "ssh", 25: "smtp", 53: "dns", 631: "cups", 3306: "mysql", 5432: "postgres", 5672: "rabbitmq",
+              6379: "redis", 9092: "kafka", 11211: "memcached", 27017: "mongodb"}
+PROJECT_MARKERS = (".git", "package.json", "pyproject.toml", "Cargo.toml", "go.mod", "composer.json",
+                   "Gemfile", "deno.json", "deno.jsonc", "manage.py", "mix.exs", "pom.xml", "build.gradle")
+
+# (regex on the command line, label). First match wins, so specific ones go first.
+FRAMEWORKS = [
+    (r"@shopify/cli|/shopify\b.*\b(app|theme) dev\b", "Shopify CLI"),
+    (r"\bnext(-server)?\b|/next/dist/", "Next.js"),
+    (r"\bnuxi?\b", "Nuxt"),
+    (r"@react-router/dev|\breact-router(-serve)?\b", "React Router"),
+    (r"@remix-run|\bremix\b", "Remix"),
+    (r"\bastro\b", "Astro"),
+    (r"svelte-?kit", "SvelteKit"),
+    (r"@angular/cli|\bng serve\b", "Angular"),
+    (r"\bstorybook\b", "Storybook"),
+    (r"\bexpo\b", "Expo"),
+    (r"\bvite\b", "Vite"),
+    (r"webpack", "webpack"),
+    (r"\bparcel\b", "Parcel"),
+    (r"\bworkerd\b|\bwrangler\b", "Wrangler"),
+    (r"@nestjs|\bnest start\b", "NestJS"),
+    (r"\bnodemon\b", "nodemon"),
+    (r"manage\.py\s+runserver", "Django"),
+    (r"\bflask\b", "Flask"),
+    (r"\buvicorn\b", "Uvicorn"),
+    (r"\bgunicorn\b", "Gunicorn"),
+    (r"\bhttp\.server\b", "Python http.server"),
+    (r"\bjupyter", "Jupyter"),
+    (r"\brails\b|\bpuma\b", "Rails"),
+    (r"artisan\s+serve", "Laravel"),
+    (r"\bphp\s+-S\b", "PHP server"),
+    (r"\bhugo\b", "Hugo"),
+    (r"\bjekyll\b", "Jekyll"),
+    (r"--remote-debugging-port", "Browser debugging"),
+    (r"\btsx\b", "tsx"),
+    (r"\bts-node\b", "ts-node"),
+    (r"\bbun\b", "Bun"),
+    (r"\bdeno\b", "Deno"),
+]
+FRAMEWORKS = [(re.compile(rx, re.I), label) for rx, label in FRAMEWORKS]
+# Servers recognised by their program name (never by words further along the command line).
+PROGRAMS = [(r"^cloudflared$", "Cloudflare Tunnel"), (r"^ngrok$", "ngrok"), (r"^workerd$", "Wrangler"),
+            (r"^mariadbd$", "MariaDB"), (r"^mysqld$", "MySQL"), (r"^postgres$", "PostgreSQL"),
+            (r"^(redis|valkey)-server$", "Redis"), (r"^mongod$", "MongoDB"), (r"^ollama$", "Ollama"),
+            (r"^caddy$", "Caddy"), (r"^nginx$", "nginx"), (r"^hugo$", "Hugo"), (r"^php-fpm", "PHP-FPM"),
+            (r"^kvrocks$", "Kvrocks")]
+PROGRAMS = [(re.compile(rx, re.I), label) for rx, label in PROGRAMS]
+DATABASES = {"MariaDB", "MySQL", "PostgreSQL", "Redis", "MongoDB", "Kvrocks"}
+
+SECRET_ARG = re.compile(r"(--?[\w-]*(?:token|password|passwd|secret|api[-_]?key|auth)[\w-]*(?:=|\s+))\S+", re.I)
+SECRET_KV = re.compile(r"\b([\w-]*(?:TOKEN|PASSWORD|PASSWD|SECRET|API_?KEY)[\w-]*=)\S+", re.I)
+URL_CREDS = re.compile(r"(\w+://[^/\s:@]+:)[^@\s/]+@")
+
+
+def settings():
+    s = dict(DEFAULTS)
+    try:
+        with open(CONF) as f:
+            user = json.load(f)
+        if isinstance(user, dict):
+            s.update(user)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as e:
+        s["_error"] = f"{CONF}: {e}"
+    return s
+
+
+def out(obj, code=0):
+    print(json.dumps(obj))
+    sys.exit(code)
+
+
+def read(path, mode="r"):
+    try:
+        with open(path, mode) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def stat_fields(pid):
+    """Fields of /proc/<pid>/stat after the command name: [state, ppid, ...]."""
+    raw = read(f"/proc/{pid}/stat")
+    if not raw:
+        return None
+    return raw.rsplit(")", 1)[1].split()
+
+
+def start_ticks(pid):
+    f = stat_fields(pid)
+    return int(f[19]) if f and len(f) > 19 else None
+
+
+def alive(pid, ticks=None):
+    """Running (not a zombie), and still the same process when ticks is given."""
+    f = stat_fields(pid)
+    if not f or f[0] in ("Z", "X"):
+        return False
+    return ticks is None or int(f[19]) == ticks
+
+
+def redact(cmd):
+    cmd = URL_CREDS.sub(r"\1***@", cmd)
+    cmd = SECRET_ARG.sub(r"\1***", cmd)
+    return SECRET_KV.sub(r"\1***", cmd)
+
+
+def proc_info(pid, uptime):
+    info = {"cmd": "", "argv": [], "cwd": "", "age": 0, "ppid": 0}
+    raw = read(f"/proc/{pid}/cmdline", "rb")
+    if raw:
+        info["argv"] = [c.decode(errors="replace") for c in raw.split(b"\0") if c]
+        info["cmd"] = redact(" ".join(info["argv"]))
+    try:
+        info["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    f = stat_fields(pid)
+    if f and len(f) > 19:
+        info["ppid"] = int(f[1])
+        info["age"] = max(0, int(uptime - int(f[19]) / CLK))
+    return info
+
+
+def project_at(path):
+    """Nearest folder at or above path with a project marker (never $HOME or /)."""
+    if not path or not path.startswith("/"):
+        return None
+    parts = path.split("/")
+    if "node_modules" in parts:
+        path = "/".join(parts[:parts.index("node_modules")]) or "/"
+    d = path
+    while d and d not in ("/", HOME):
+        if any(os.path.exists(os.path.join(d, m)) for m in PROJECT_MARKERS):
+            return {"name": os.path.basename(d), "path": d}
+        d = os.path.dirname(d)
+    return None
+
+
+def project_of(info):
+    proj = project_at(info["cwd"])
+    if proj:
+        return proj
+    # Started from elsewhere: look at the script it runs (`node ~/app/server.js`).
+    for a in info["argv"][1:6]:
+        if a.startswith("-"):
+            continue
+        p = a if a.startswith("/") else os.path.join(info["cwd"] or "/", a)
+        if os.path.isfile(p):
+            proj = project_at(os.path.dirname(p))
+            if proj:
+                return proj
+    return None
+
+
+def framework_of(info, name, proj):
+    """What the process is, from its program name, else from its command line."""
+    progs = [name, os.path.basename(info["argv"][0]) if info["argv"] else ""]
+    for rx, label in PROGRAMS:
+        if any(rx.match(p) for p in progs):
+            return label
+    c = info["cmd"].replace(proj["path"], "") if proj else info["cmd"]
+    c = c.replace(HOME, "~")
+    for rx, label in FRAMEWORKS:
+        if rx.search(c):
+            return label
+    return ""
+
+
+def inspector_port(cmd, name):
+    m = re.search(r"--inspect(?:-brk)?(?:=(?:[\w.\[\]:]+:)?(\d+))?(?:\s|$)", cmd)
+    if m:
+        return int(m.group(1)) if m.group(1) else 9229
+    # NODE_OPTIONS=--inspect does not show on the command line; 9229 is node's default.
+    return 9229 if name.startswith("node") else 0
+
+
+def user_name(uid):
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return str(uid)
+
+
+def unit_of(cgroup):
+    """systemd unit a socket's process runs under: `postgresql.service`, `app-foo.service`."""
+    last = cgroup.rstrip("/").rsplit("/", 1)[-1] if cgroup else ""
+    return last if last.endswith(".service") and not last.startswith("user@") else ""
+
+
+def is_loopback(addr):
+    return addr.startswith("127.") or addr == "::1" or addr == "localhost"
+
+
+def is_wildcard(addr):
+    return addr in ("*", "0.0.0.0", "::", "[::]")
+
+
+def url_for(port, addresses):
+    if any(is_loopback(a) or is_wildcard(a) for a in addresses) or not addresses:
+        return f"http://localhost:{port}"
+    a = addresses[0]
+    return f"http://[{a}]:{port}" if ":" in a else f"http://{a}:{port}"
+
+
+def parse_ss():
+    """Listening TCP sockets as dicts, or raise RuntimeError."""
+    if not shutil.which("ss"):
+        raise RuntimeError("`ss` not found — install iproute2")
+    try:
+        r = subprocess.run(["ss", "-ltnpeH"], capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("`ss` timed out")
+    if r.returncode != 0:
+        raise RuntimeError("ss: " + (r.stderr.strip().splitlines() or ["failed"])[-1])
+    socks = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0] != "LISTEN":
+            continue
+        addr, _, port = parts[3].rpartition(":")
+        if not port.isdigit():
+            continue
+        addr = addr.strip("[]").split("%", 1)[0]
+        users = [(n.replace('\\"', '"'), int(p)) for n, p in re.findall(r'\("((?:[^"\\]|\\.)*)",pid=(\d+),', line)]
+        uid = re.search(r"\buid:(\d+)", line)
+        cg = re.search(r"\bcgroup:(\S+)", line)
+        ino = re.search(r"\bino:(\d+)", line)
+        socks.append({"port": int(port), "addr": addr, "users": users, "ino": ino.group(1) if ino else "",
+                      "uid": int(uid.group(1)) if uid else 0, "cgroup": cg.group(1) if cg else ""})
+    return socks
+
+
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "omarchy", "devports-docker.json")
+
+
+def docker_ports(key):
+    """{host_port: {name, image, id, project}} for running containers, if Docker is reachable.
+
+    `docker ps` can take seconds, so the answer is cached until the set of
+    Docker-owned sockets (`key`) changes."""
+    try:
+        with open(CACHE) as f:
+            c = json.load(f)
+        if c.get("key") == key:
+            return {int(k): v for k, v in c["ports"].items()}
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass
+    found = _docker_ps()
+    if found is not None:
+        try:
+            os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+            tmp = f"{CACHE}.{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump({"key": key, "ports": found}, f)
+            os.replace(tmp, CACHE)
+        except OSError:
+            pass
+    return found or {}
+
+
+def _docker_ps():
+    if not shutil.which("docker"):
+        return None
+    fmt = '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Label "com.docker.compose.project.working_dir"}}'
+    try:
+        r = subprocess.run(["docker", "ps", "--format", fmt], capture_output=True, text=True, timeout=3)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    found = {}
+    for line in r.stdout.splitlines():
+        cols = line.split("\t")
+        if len(cols) < 5:
+            continue
+        cid, name, image, ports, wd = cols[:5]
+        proj = {"name": os.path.basename(wd.rstrip("/")), "path": wd} if wd else None
+        for m in re.finditer(r"(?:[\d.]+|\[?[0-9a-f:]*\]?):(\d+)(?:-(\d+))?->(\d+)(?:-\d+)?/tcp", ports):
+            lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+            for p in range(lo, min(hi, lo + 64) + 1):
+                found[p] = {"id": cid, "name": name, "image": image, "project": proj}
+    return found
+
+
+def cmd_list():
+    s = settings()
+    try:
+        socks = parse_ss()
+    except RuntimeError as e:
+        out({"ports": [], "error": str(e), "at": int(time.time())})
+    uptime = float(read("/proc/uptime").split()[0])
+    ignore = [str(x).lower() for x in (s.get("ignore") or []) if str(x).strip()]
+    infos, docker = {}, None
+    docker_key = ",".join(sorted(f"{sk['port']}/{sk['ino']}" for sk in socks
+                                 if not sk["users"] and unit_of(sk["cgroup"]).startswith("docker")))
+    merged = {}   # (port, owner) -> entry
+    for sk in socks:
+        pid, name = 0, ""
+        if sk["users"]:
+            pids = [p for _, p in sk["users"]]
+            # Forked servers share one socket: pick the parent of the group.
+            for n, p in sk["users"]:
+                if p not in infos:
+                    infos[p] = proc_info(p, uptime)
+            roots = [p for p in pids if infos[p]["ppid"] not in pids] or pids
+            pid = min(roots)
+            name = dict((p, n) for n, p in sk["users"])[pid]
+        unit = unit_of(sk["cgroup"])
+        owner = pid if pid else f"{sk['uid']}:{unit}"
+        key = (sk["port"], owner)
+        e = merged.get(key)
+        if e:
+            if sk["addr"] not in e["addresses"]:
+                e["addresses"].append(sk["addr"])
+            continue
+        merged[key] = e = {"port": sk["port"], "addresses": [sk["addr"]], "pid": pid, "name": name,
+                           "uid": sk["uid"], "unit": unit}
+
+    ports, projects = [], {}
+    for e in merged.values():
+        pid, port = e["pid"], e["port"]
+        info = infos.get(pid) or {"cmd": "", "argv": [], "cwd": "", "age": 0}
+        if pid and pid not in projects:
+            projects[pid] = project_of(info)
+        proj = projects.get(pid)
+        framework = framework_of(info, e["name"], proj) if pid else ""
+        container = None
+        kind = "dev"
+        if not pid:
+            kind = "system"
+            if e["unit"] == "docker.service" or e["unit"].startswith("docker"):
+                if docker is None:
+                    docker = docker_ports(docker_key)
+                container = docker.get(port)
+            if container:
+                kind = "docker"
+                proj = container["project"]
+                framework = container["image"]
+            e["name"] = (container["name"] if container
+                         else e["unit"].removesuffix(".service") if e["unit"]
+                         else WELL_KNOWN.get(port) or user_name(e["uid"]))
+        else:
+            argv0 = os.path.basename(info["argv"][0]) if info["argv"] else ""
+            names = (e["name"].lower(), argv0.lower())
+            in_session = "/session.slice/" in (read(f"/proc/{pid}/cgroup") or "")
+            if (any(APPS.match(n) for n in names) or any(n.startswith(i) for n in names for i in ignore)
+                    or (not proj and (any(TOOLS.match(n) for n in names) or in_session))):
+                kind = "app"
+        insp = inspector_port(info["cmd"], e["name"]) if pid else 0
+        label = "debugger" if insp and insp == port else ""
+        http = not (label or port in NOT_HTTP_PORTS or NOT_HTTP_NAMES.match(e["name"])
+                    or framework in DATABASES)
+        addrs = sorted(e["addresses"], key=lambda a: (":" in a, a))
+        public = any(not is_loopback(a) for a in addrs)
+        ports.append({
+            "port": port, "address": addrs[0], "addresses": addrs, "public": public,
+            "pid": pid, "name": e["name"], "cmd": info["cmd"], "cwd": info["cwd"], "age": info["age"],
+            "project": proj, "system": not pid, "noise": kind == "app",
+            "url": url_for(port, addrs), "kind": kind, "framework": framework, "label": label, "http": http,
+            "user": user_name(e["uid"]), "unit": e["unit"],
+            "container": {k: container[k] for k in ("id", "name", "image")} if container else None,
+        })
+    order = {"dev": 0, "docker": 1, "app": 2, "system": 3}
+    ports.sort(key=lambda p: (order[p["kind"]], (p["project"] or {}).get("name", "~").lower(), p["pid"], p["port"]))
+    result = {"ports": ports, "at": int(time.time())}
+    if s.get("_error"):
+        result["error"] = "Settings ignored — " + s["_error"]
+    out(result)
+
+
+# ---------- stop / kill ----------
+
+def ppid_map():
+    kids = {}
+    for d in os.listdir("/proc"):
+        if d.isdigit():
+            f = stat_fields(d)
+            if f and len(f) > 1:
+                kids.setdefault(int(f[1]), []).append(int(d))
+    return kids
+
+
+def tree(pid):
+    """pid and all its descendants, parents first."""
+    kids, order, todo = ppid_map(), [], [pid]
+    while todo:
+        p = todo.pop(0)
+        order.append(p)
+        todo += kids.get(p, [])
+    return order
+
+
+def ancestors():
+    seen, p = set(), os.getpid()
+    while p > 1 and p not in seen:
+        seen.add(p)
+        f = stat_fields(p)
+        p = int(f[1]) if f else 1
+    return seen
+
+
+def listening_pids(port):
+    try:
+        r = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return {int(p) for p in re.findall(r"pid=(\d+)", r.stdout)}
+
+
+def cmd_signal(pid_arg, how, port_arg=None):
+    s = settings()
+    try:
+        pid = int(pid_arg)
+        port = int(port_arg) if port_arg else 0
+    except ValueError:
+        out({"error": "pid and port must be numbers"}, 2)
+    if pid <= 1 or not alive(pid):
+        out({"error": f"Process {pid} is not running"}, 1)
+    try:
+        owner = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        out({"error": f"Process {pid} is not running"}, 1)
+    if owner != os.getuid():
+        out({"error": f"Process {pid} belongs to {user_name(owner)}, not you"}, 1)
+    comm = (read(f"/proc/{pid}/comm") or "").strip()
+    if pid in ancestors() or comm in ("systemd", "Hyprland", "uwsm", "quickshell", "qs"):
+        out({"error": f"Refusing to stop {comm or pid}: it runs your session"}, 1)
+    if port:
+        pids = listening_pids(port)
+        if pids is not None and pid not in pids:
+            out({"error": f"Process {pid} no longer listens on :{port} — refreshed the list"}, 1)
+
+    victims = [(p, start_ticks(p)) for p in tree(pid)]
+    victims = [(p, t) for p, t in victims if t is not None]
+
+    def send(sig, who):
+        n = 0
+        for p, t in who:
+            if not alive(p, t):
+                continue
+            try:
+                os.kill(p, sig)
+                n += 1
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        return n
+
+    def wait(who, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            if not any(alive(p, t) for p, t in who):
+                return True
+            time.sleep(0.1)
+        return not any(alive(p, t) for p, t in who)
+
+    forced = False
+    if how == "kill":
+        signalled = send(signal.SIGKILL, victims)
+        forced = True
+        wait(victims, 2)
+    else:
+        signalled = send(signal.SIGTERM, victims)
+        try:
+            grace = max(0.0, min(60.0, float(s.get("stopGraceSeconds", 5))))
+        except (TypeError, ValueError):
+            grace = 5.0
+        if not wait(victims, grace):
+            left = [(p, t) for p, t in victims if alive(p, t)]
+            if left:
+                forced = True
+                send(signal.SIGKILL, left)
+                wait(left, 2)
+    stopped = not alive(victims[0][0], victims[0][1]) if victims else True
+    res = {"ok": stopped, "stopped": stopped, "forced": forced, "signalled": signalled, "pid": pid}
+    if not stopped:
+        res["error"] = f"Process {pid} is still running"
+    out(res, 0 if stopped else 1)
+
+
+# ---------- editor / settings ----------
+
+TUI_EDITORS = {"nvim", "vim", "vi", "nano", "micro", "hx", "helix", "kak", "emacs", "fresh"}
+
+
+def launch(argv, cwd=None):
+    if not argv[0].startswith("omarchy-launch") and shutil.which("uwsm-app"):
+        argv = ["uwsm-app", "--", *argv]
+    subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def open_in_editor(path, s):
+    editor = os.path.expandvars(str(s.get("editor") or DEFAULTS["editor"])).strip()
+    argv = shlex.split(editor) or shlex.split(DEFAULTS["editor"])
+    if not shutil.which(argv[0]):
+        return f"Editor `{argv[0]}` not found — set \"editor\" in {CONF}"
+    if os.path.basename(argv[0]) in TUI_EDITORS and shutil.which("xdg-terminal-exec"):
+        folder = path if os.path.isdir(path) else os.path.dirname(path)
+        launch(["xdg-terminal-exec", f"--dir={folder}", *argv, path])
+    else:
+        launch([*argv, path], cwd=path if os.path.isdir(path) else os.path.dirname(path))
+    return ""
+
+
+def cmd_editor(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(path):
+        out({"error": f"Not a folder: {path}"}, 1)
+    err = open_in_editor(path, settings())
+    out({"error": err} if err else {"ok": True}, 1 if err else 0)
+
+
+def cmd_settings():
+    if not os.path.exists(CONF):
+        os.makedirs(os.path.dirname(CONF), exist_ok=True)
+        with open(CONF, "w") as f:
+            json.dump(DEFAULTS, f, indent=2)
+            f.write("\n")
+    err = open_in_editor(CONF, settings())
+    out({"error": err} if err else {"ok": True, "path": CONF}, 1 if err else 0)
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["list"]:
+        cmd_list()
+    elif a[:1] in (["stop"], ["kill"]) and len(a) in (2, 3):
+        cmd_signal(a[1], a[0], a[2] if len(a) == 3 else None)
+    elif a[:1] == ["editor"] and len(a) == 2:
+        cmd_editor(a[1])
+    elif a[:1] == ["settings"]:
+        cmd_settings()
+    else:
+        print(__doc__)
+        sys.exit(2)

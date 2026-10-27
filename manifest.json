@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "techspawn.devports",
+  "name": "Dev Ports",
+  "version": "1.1.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "Every local dev server at a glance: which ports are listening, which project and framework each one belongs to, and how long it has been up. Open or copy its URL, open the project in your editor, or stop it safely (SIGTERM, then SIGKILL if it hangs). Docker containers and system services are labelled too.",
+  "repository": "https://github.com/RajShimpi/omarchy-devports",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Dev Ports",
+    "description": "Running dev servers and their ports: open, copy, stop",
+    "category": "Development",
+    "aliases": ["ports", "dev servers", "localhost", "kill port"],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
