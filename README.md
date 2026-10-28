@@ -119,7 +119,8 @@ processes of other users and the ones that run your session.
   `uwsm-app` starts the editor. Omarchy ships all three.
 - Optional: `docker`, to name container ports. `docker ps` can take a few
   seconds, so its answer is cached in `~/.cache/omarchy/devports-docker.json`
-  until the set of Docker sockets changes.
+  until the set of Docker sockets changes. Only you can read that file
+  (`0600`): it holds container names and project paths.
 - The list refreshes every 3 s while the panel is open, and every 30 s
   otherwise for the badge. No root, no network access, nothing sent anywhere.
 

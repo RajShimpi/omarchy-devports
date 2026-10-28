@@ -245,6 +245,7 @@ Panel {
       color: Commons.Color.accent
       Text {
         id: countText
+        textFormat: Text.PlainText
         anchors.centerIn: parent
         text: root.devCount > 9 ? "9+" : String(root.devCount)
         color: root.bar ? root.bar.background : Commons.Color.background
@@ -316,12 +317,13 @@ Panel {
             Row {
               id: hero
               spacing: Style.space(14)
-              Text { text: root.glyph("hub"); color: root.fg; font.family: root.font; font.pixelSize: Style.font.display; anchors.verticalCenter: parent.verticalCenter }
+              Text { textFormat: Text.PlainText; text: root.glyph("hub"); color: root.fg; font.family: root.font; font.pixelSize: Style.font.display; anchors.verticalCenter: parent.verticalCenter }
               Column {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
-                Text { text: "Dev Ports"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
+                Text { textFormat: Text.PlainText; text: "Dev Ports"; color: root.fg; font.family: root.font; font.pixelSize: Style.font.title; font.bold: true }
                 Text {
+                  textFormat: Text.PlainText
                   text: (root.devCount + " running · " + root.procCount + " process" + (root.procCount === 1 ? "" : "es") + " · " + root.portCount + " port" + (root.portCount === 1 ? "" : "s")).toUpperCase()
                   color: Qt.darker(root.fg, 1.4); font.family: root.font; font.pixelSize: Style.font.caption; font.bold: true; font.letterSpacing: 1.2
                 }
@@ -353,6 +355,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.listError !== ""
             width: parent.width
             wrapMode: Text.Wrap
@@ -361,6 +364,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             visible: root.status !== ""
             width: parent.width
             wrapMode: Text.Wrap
@@ -437,6 +441,7 @@ Panel {
                       spacing: Style.space(4)
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: root.icon(entry.modelData) + " " + root.title(entry.modelData)
                         color: root.fg; font.family: root.font; font.pixelSize: Style.font.bodySmall; font.bold: true
@@ -444,6 +449,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         text: root.meta(entry.modelData)
                         color: Qt.darker(root.fg, 1.5); font.family: root.font; font.pixelSize: Style.font.caption
@@ -451,6 +457,7 @@ Panel {
                       }
 
                       Text {
+                        textFormat: Text.PlainText
                         visible: entry.own && entry.modelData.cmd !== ""
                         width: parent.width
                         text: root.shortCmd(entry.modelData.cmd)
@@ -472,6 +479,7 @@ Panel {
                             color: portArea.containsMouse ? Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.3) : Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.1)
                             Text {
                               id: portText
+                              textFormat: Text.PlainText
                               anchors.centerIn: parent
                               text: ":" + chip.modelData.port + (chip.modelData.label === "debugger" ? " " + root.glyph("debug") + " debugger"
                                                                  : chip.modelData.http ? " " + root.glyph("open") : "")
@@ -536,6 +544,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.procs.length === 0
                 width: parent.width
                 topPadding: Style.space(10)
@@ -548,6 +557,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.procs.length > 0
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter

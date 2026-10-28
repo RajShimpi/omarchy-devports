@@ -279,6 +279,8 @@ def docker_ports(key):
     Docker-owned sockets (`key`) changes."""
     try:
         with open(CACHE) as f:
+            if os.fstat(f.fileno()).st_mode & 0o077:   # written world-readable by 1.1.0
+                os.fchmod(f.fileno(), 0o600)
             c = json.load(f)
         if c.get("key") == key:
             return {int(k): v for k, v in c["ports"].items()}
@@ -290,6 +292,7 @@ def docker_ports(key):
             os.makedirs(os.path.dirname(CACHE), exist_ok=True)
             tmp = f"{CACHE}.{os.getpid()}"
             with open(tmp, "w") as f:
+                os.fchmod(f.fileno(), 0o600)   # container names and project paths: this user only
                 json.dump({"key": key, "ports": found}, f)
             os.replace(tmp, CACHE)
         except OSError:
